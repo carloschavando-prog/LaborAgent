@@ -203,15 +203,12 @@ def _pct_val(cost, sales):
     return cost / sales * 100
 
 
-def _pct_class(val) -> str:
-    """Color code: labor % above 30% is red, 20-30% yellow, below 20% green."""
+_PCT_THRESHOLD = {"kit": 20, "foh": 10, "tot": 15}
+
+def _pct_class(val, dept: str) -> str:
     if val is None:
         return ""
-    if val >= 30:
-        return "pct-high"
-    if val >= 20:
-        return "pct-mid"
-    return "pct-low"
+    return "pct-high" if val >= _PCT_THRESHOLD[dept] else "pct-low"
 
 
 def _hrs_display(actual, sched) -> str:
@@ -379,13 +376,13 @@ def _tr(row: dict) -> str:
             f'<td>{_fmt_sales(row.get("total_sales"))}</td>'
             f'<td class="hrs">{_hrs_display(row.get("kit_hours"), row.get("kit_sched"))}</td>'
             f'<td>{_fmt_cost(row.get("kit_cost"))}</td>'
-            f'<td class="{_pct_class(kp)}">{_fmt_pct(kp)}</td>'
+            f'<td class="{_pct_class(kp, "kit")}">{_fmt_pct(kp)}</td>'
             f'<td class="hrs">{_hrs_display(row.get("foh_hours"), row.get("foh_sched"))}</td>'
             f'<td>{_fmt_cost(row.get("foh_cost"))}</td>'
-            f'<td class="{_pct_class(fp)}">{_fmt_pct(fp)}</td>'
+            f'<td class="{_pct_class(fp, "foh")}">{_fmt_pct(fp)}</td>'
             f'<td class="hrs">{_hrs_display(row.get("tot_hours"), row.get("tot_sched"))}</td>'
             f'<td>{_fmt_cost(row.get("tot_cost"))}</td>'
-            f'<td class="{_pct_class(tp)}">{_fmt_pct(tp)}</td>'
+            f'<td class="{_pct_class(tp, "tot")}">{_fmt_pct(tp)}</td>'
             f'</tr>'
         )
 
@@ -399,13 +396,13 @@ def _tr(row: dict) -> str:
         f'<td>{_fmt_sales(row.get("total_sales"))}</td>'
         f'<td class="hrs">{_fmt_hrs(row.get("kit_hours"))}</td>'
         f'<td>{_fmt_cost(row.get("kit_cost"))}</td>'
-        f'<td class="{_pct_class(kp)}">{_fmt_pct(kp)}</td>'
+        f'<td class="{_pct_class(kp, "kit")}">{_fmt_pct(kp)}</td>'
         f'<td class="hrs">{_fmt_hrs(row.get("foh_hours"))}</td>'
         f'<td>{_fmt_cost(row.get("foh_cost"))}</td>'
-        f'<td class="{_pct_class(fp)}">{_fmt_pct(fp)}</td>'
+        f'<td class="{_pct_class(fp, "foh")}">{_fmt_pct(fp)}</td>'
         f'<td class="hrs">{_fmt_hrs(row.get("tot_hours"))}</td>'
         f'<td>{_fmt_cost(row.get("tot_cost"))}</td>'
-        f'<td class="{_pct_class(tp)}">{_fmt_pct(tp)}</td>'
+        f'<td class="{_pct_class(tp, "tot")}">{_fmt_pct(tp)}</td>'
         f'</tr>'
     )
 
@@ -561,7 +558,6 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
   }}
 
   .pct-low  {{ color: #006100; font-weight: 600; }}
-  .pct-mid  {{ color: #7d4e00; font-weight: 600; }}
   .pct-high {{ color: #9c0006; font-weight: 600; }}
 
   .legend {{
@@ -594,9 +590,8 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
 </header>
 <div class="tab-bar">{tabs_html}</div>
 <div class="legend">
-  <span><span class="dot dot-low"></span> &lt;20% labor</span>
-  <span><span class="dot dot-mid"></span> 20–30%</span>
-  <span><span class="dot dot-high"></span> &gt;30%</span>
+  <span><span class="dot dot-low"></span> On target</span>
+  <span><span class="dot dot-high"></span> Over threshold (KIT &gt;20% · FOH &gt;10% · Total &gt;15%)</span>
   <span style="margin-left:16px;color:#555">KIT % = KIT cost ÷ Food sales &nbsp;·&nbsp; FOH % = FOH cost ÷ (Total − Food) &nbsp;·&nbsp; Total % = Total cost ÷ Total sales</span>
   <span style="margin-left:16px;color:#555">Week subtotals: actual hrs / sched hrs</span>
 </div>
