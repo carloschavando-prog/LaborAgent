@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/labor_fetch",
+      "schedule": "0 10 * * *"
+    }
+  ]
+}
