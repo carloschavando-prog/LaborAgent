@@ -148,7 +148,7 @@ Food categories (used to calculate KIT% denominator):
 - **FOH %** = FOH cost ÷ (Total Sales − Food Sales)
 - **Total %** = Total cost ÷ Total Sales
 
-Color coding: green < 20%, amber 20–30%, red > 30%
+Color coding: green = on target, red = over threshold (KIT >20%, FOH >10%, Total >15%)
 
 ---
 
