@@ -48,11 +48,11 @@ _FY_STARTS = {
 
 AVAILABLE_YEARS = sorted(_FY_STARTS.keys())
 
-_REVENUE_COLS = [
-    "food", "beverage", "mini_golf", "bowling", "karaoke", "darts",
-    "shuffle_board", "pool", "merchandise", "events", "open_item",
-    "bottle_svc", "reservations", "gift_card", "redeemed",
-]
+_FOOD_CATEGORIES = {
+    "Chicken.", "Extra Sauces and Cheese Dips", "Fry Platters",
+    "Half Pound Burgers", "Mozzarella Sticks", "Pizza and Flatbreads",
+    "Pretzels", "Tater Kegs", "Wraps",
+}
 
 
 def _fy_start(fy: int) -> date:
@@ -131,21 +131,35 @@ def _fetch_labor(start: date, end: date) -> dict:
 
 
 def _fetch_revenue(start: date, end: date) -> dict:
-    """Returns {date_str: {food, total}} aggregated across gotab + tripleseat."""
-    col_select = ",".join(_REVENUE_COLS)
-    rows = _supa_paged(
-        f"/daily_revenue?report_date=gte.{start}&report_date=lte.{end}"
-        f"&select=report_date,{col_select}"
-    )
+    """Returns {date_str: {food, total}} from sales (GoTab) + ts_events (Tripleseat)."""
     by_date: dict = {}
-    for row in rows:
+
+    # GoTab sales rows
+    sales_rows = _supa_paged(
+        f"/sales?report_date=gte.{start}&report_date=lte.{end}"
+        f"&select=report_date,category,net_sales"
+    )
+    for row in sales_rows:
         d = row["report_date"]
         if d not in by_date:
             by_date[d] = {"food": 0.0, "total": 0.0}
-        food = float(row.get("food") or 0)
-        total = sum(float(row.get(c) or 0) for c in _REVENUE_COLS)
-        by_date[d]["food"]  = round(by_date[d]["food"]  + food,  2)
-        by_date[d]["total"] = round(by_date[d]["total"] + total, 2)
+        amt = float(row.get("net_sales") or 0)
+        if row.get("category") in _FOOD_CATEGORIES:
+            by_date[d]["food"] = round(by_date[d]["food"] + amt, 2)
+        by_date[d]["total"] = round(by_date[d]["total"] + amt, 2)
+
+    # Tripleseat events
+    ts_rows = _supa_paged(
+        f"/ts_events?event_date=gte.{start}&event_date=lte.{end}"
+        f"&deleted_at=is.null&select=event_date,actual_amount"
+    )
+    for row in ts_rows:
+        d = row["event_date"]
+        if d not in by_date:
+            by_date[d] = {"food": 0.0, "total": 0.0}
+        amt = float(row.get("actual_amount") or 0)
+        by_date[d]["total"] = round(by_date[d]["total"] + amt, 2)
+
     return by_date
 
 
