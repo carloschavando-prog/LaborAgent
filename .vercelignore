@@ -1,0 +1,6 @@
+tests/
+.env*
+schema/
+LABOR_AGENT.md
+INCIDENT_2026-10-15.md
+.git/

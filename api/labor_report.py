@@ -284,6 +284,13 @@ def _answer_labor_question(
         return "I could not find the requested data in that date range."
 
     weekday = _question_weekday(q)
+    pending = [d for d, row in labor.items()
+               if row.get("import_status") == "pending"
+               and start <= date.fromisoformat(d) <= end
+               and (weekday is None or date.fromisoformat(d).weekday() == weekday)]
+    if measure != "sales" and pending:
+        return (f"Labor totals for this range are incomplete: {len(pending)} day(s) are awaiting "
+                "complete approved time punches. Pending days are excluded from labor subtotals.")
     aggregation = _question_aggregation(q)
     points = []
     current = start
@@ -410,7 +417,7 @@ def _fetch_labor(start: date, end: date) -> dict:
     rows = _supa_paged(
         f"/labor_daily?date=gte.{start}&date=lte.{end}"
         f"&select=date,kit_hours,kit_sched,kit_cost,foh_hours,foh_sched,foh_cost,"
-        f"total_hours,total_sched,total_cost"
+        f"total_hours,total_sched,total_cost,import_status,import_note"
     )
     return {r["date"]: r for r in rows}
 
@@ -551,6 +558,13 @@ def _build_rows(fy: int, today: date, labor: dict, revenue: dict) -> list:
                         "_type": "future" if is_fut else "nodata",
                         "date": ds, "day": _DAYS[d.weekday()],
                     }
+                elif lab.get("import_status") == "pending":
+                    row = {
+                        "_type": "pending", "date": ds, "day": _DAYS[d.weekday()],
+                        "total_sales": rev.get("total", 0.0),
+                        "food_sales": rev.get("food", 0.0),
+                        "foh_sales": max(rev.get("total", 0.0) - rev.get("food", 0.0), 0.0),
+                    }
                 else:
                     food_sales  = rev.get("food",  0.0)
                     total_sales = rev.get("total", 0.0)
@@ -597,8 +611,13 @@ def _build_rows(fy: int, today: date, labor: dict, revenue: dict) -> list:
 
 
 def _subtotal_row(data_rows: list, label: str, row_type: str) -> dict:
+    pending_count = sum(r.get("_type") == "pending" for r in data_rows)
+    if pending_count:
+        label += f" — partial ({pending_count} pending)"
+
     def _sum(key):
-        return round(sum(float(r.get(key) or 0) for r in data_rows if r.get("_type") == "data"), 2)
+        included = ("data", "pending") if key in ("total_sales", "food_sales", "foh_sales") else ("data",)
+        return round(sum(float(r.get(key) or 0) for r in data_rows if r.get("_type") in included), 2)
 
     kit_cost  = _sum("kit_cost")
     foh_cost  = _sum("foh_cost")
@@ -619,13 +638,13 @@ def _subtotal_row(data_rows: list, label: str, row_type: str) -> dict:
         "total_sales": total_s,
         "kit_hours":  kit_h,  "kit_sched":  kit_sch,
         "kit_cost":   kit_cost,
-        "kit_pct":    _pct_val(kit_cost, food),
+        "kit_pct":    None if pending_count else _pct_val(kit_cost, food),
         "foh_hours":  foh_h,  "foh_sched":  foh_sch,
         "foh_cost":   foh_cost,
-        "foh_pct":    _pct_val(foh_cost, foh_s),
+        "foh_pct":    None if pending_count else _pct_val(foh_cost, foh_s),
         "tot_hours":  tot_h,  "tot_sched":  tot_sch,
         "tot_cost":   tot_cost,
-        "tot_pct":    _pct_val(tot_cost, total_s),
+        "tot_pct":    None if pending_count else _pct_val(tot_cost, total_s),
     }
 
 
@@ -651,6 +670,15 @@ def _tr(row: dict) -> str:
             f'<td>{label}</td><td>{label}</td><td>{label}</td>'
             f'<td>{label}</td><td>{label}</td><td>{label}</td>'
             f'</tr>'
+        )
+
+    if t == "pending":
+        return (
+            '<tr class="pending">'
+            f'<td>{row["date"]}</td><td>{row["day"]}</td>'
+            f'<td>{_fmt_sales(row.get("total_sales"))}</td>'
+            '<td colspan="9">Pending — awaiting complete approved time punches</td>'
+            '</tr>'
         )
 
     if t in ("week_sub", "period_tot"):
@@ -932,6 +960,8 @@ def _render_html(
   td.tot-sep  {{ border-left: 2px solid #ddd; }}
 
   tr.data:hover {{ background: #f2faf5; }}
+  tr.pending {{ background: #fff3cd; color: #664d03; }}
+  tr.pending td:last-child {{ text-align: left; font-weight: 600; }}
 
   tr.future td, tr.nodata td {{ color: #bbb; background: #fafafa; }}
 
@@ -1046,7 +1076,7 @@ def _render_html(
 {table_rows}
   </tbody>
 </table>
-<p class="updated">Source: 7Shifts time punches &nbsp;·&nbsp; Sales from GoTab + Tripleseat &nbsp;·&nbsp; Data refreshes nightly at 6 AM ET</p>
+<p class="updated">Source: approved 7Shifts time punches &nbsp;·&nbsp; Sales from GoTab + Tripleseat &nbsp;·&nbsp; Recent 28 days rechecked nightly · Pending days excluded from labor subtotals</p>
 </div>
 </body>
 </html>"""
