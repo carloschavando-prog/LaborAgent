@@ -18,12 +18,15 @@ Required env vars:
   SUPABASE_URL, SUPABASE_SERVICE_KEY, REPORT_KEY
 """
 
+import calendar
 import json
 import os
+import re
 import urllib.request
 from datetime import date, timedelta
+from html import escape
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, quote, urlparse
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -47,6 +50,15 @@ _FY_STARTS = {
 }
 
 AVAILABLE_YEARS = sorted(_FY_STARTS.keys())
+
+_WEEKDAY_NAMES = [
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
+]
+_NUMBER_WORDS = {
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+    "eleven": "11", "twelve": "12",
+}
 
 _FOOD_CATEGORIES = {
     "Chicken.", "Extra Sauces and Cheese Dips", "Fry Platters",
@@ -84,6 +96,286 @@ def _periods_to_show(fy: int, today: date) -> int:
     if fy == current_fy:
         return _current_period(today, fy)
     return 12
+
+
+# ---------------------------------------------------------------------------
+# Natural-language questions
+# ---------------------------------------------------------------------------
+
+def _normalize_question(question: str) -> str:
+    normalized = question.lower().strip()
+    for word, number in _NUMBER_WORDS.items():
+        normalized = re.sub(rf"\b{word}\b", number, normalized)
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _subtract_months(value: date, months: int) -> date:
+    month_index = value.year * 12 + value.month - 1 - months
+    year, month_zero = divmod(month_index, 12)
+    month = month_zero + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _question_period(question: str, fy: int, today: date) -> tuple:
+    q = _normalize_question(question)
+    fy_start = _fy_start(fy)
+    _, fy_end = _period_bounds(12, fy)
+    report_end = min(fy_end, today - timedelta(days=1))
+    report_end = max(report_end, fy_start)
+
+    if "yesterday" in q:
+        return report_end, report_end
+    if "this week" in q or "week to date" in q:
+        return max(fy_start, report_end - timedelta(days=report_end.weekday())), report_end
+    if "this month" in q or "month to date" in q:
+        return max(fy_start, report_end.replace(day=1)), report_end
+    if "year to date" in q or "fiscal year to date" in q or "this fiscal year" in q:
+        return fy_start, report_end
+
+    duration = None
+    patterns = (
+        r"(?:last|past|previous|prior)\s+(\d+)\s*(day|week|month|year)s?",
+        r"(?:going\s+back|back)\s+(\d+)\s*(day|week|month|year)s?",
+        r"(\d+)\s*(day|week|month|year)s?\s*(?:back|ago)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, q)
+        if match:
+            duration = (max(1, int(match.group(1))), match.group(2))
+            break
+
+    if duration is None:
+        match = re.search(r"(?:last|past|previous|prior)\s+(day|week|month|year)\b", q)
+        if match:
+            duration = (1, match.group(1))
+
+    if duration:
+        amount, unit = duration
+        if unit == "day":
+            period_start = report_end - timedelta(days=amount - 1)
+        elif unit == "week":
+            period_start = report_end - timedelta(days=amount * 7 - 1)
+        elif unit == "month":
+            period_start = _subtract_months(report_end, amount) + timedelta(days=1)
+        else:
+            period_start = _subtract_months(report_end, amount * 12) + timedelta(days=1)
+        return max(fy_start, period_start), report_end
+
+    return fy_start, report_end
+
+
+def _question_weekday(question: str):
+    q = _normalize_question(question)
+    for index, name in enumerate(_WEEKDAY_NAMES):
+        if re.search(rf"\b{name.lower()}s?\b", q):
+            return index
+    return None
+
+
+def _question_aggregation(question: str) -> str:
+    q = _normalize_question(question)
+    if re.search(r"\b(average|avg|mean)\b", q) or "what do we average" in q:
+        return "average"
+    if re.search(r"\b(highest|best|maximum|max|most)\b", q):
+        return "maximum"
+    if re.search(r"\b(lowest|worst|minimum|min|least)\b", q):
+        return "minimum"
+    if re.search(r"\b(sum|total|combined|altogether)\b", q) or "how much" in q:
+        return "total"
+    return "summary"
+
+
+def _labor_measure(question: str) -> tuple:
+    q = _normalize_question(question)
+    if re.search(r"\b(sales|revenue)\b", q):
+        return "sales", "tot", "sales", "currency"
+
+    if re.search(r"\b(kit|kitchen|boh|back of house)\b", q):
+        department, department_label = "kit", "kitchen"
+    elif re.search(r"\b(foh|front of house)\b", q):
+        department, department_label = "foh", "FOH"
+    else:
+        department, department_label = "tot", "total"
+
+    if "scheduled" in q or "schedule hours" in q:
+        return "scheduled_hours", department, f"{department_label} scheduled hours", "hours"
+    if re.search(r"\b(hours|hour|hrs|hrs\.)\b", q):
+        return "hours", department, f"{department_label} labor hours", "hours"
+    if re.search(r"\b(cost|costs|payroll|wages|dollars|spend|spent)\b", q):
+        return "cost", department, f"{department_label} labor cost", "currency"
+    return "percentage", department, f"{department_label} labor percentage", "percentage"
+
+
+def _format_question_range(start: date, end: date) -> str:
+    if start == end:
+        return start.strftime("%B %-d, %Y")
+    if start.year == end.year:
+        return f"{start.strftime('%B %-d')}–{end.strftime('%B %-d, %Y')}"
+    return f"{start.strftime('%B %-d, %Y')}–{end.strftime('%B %-d, %Y')}"
+
+
+def _format_question_value(value: float, unit: str) -> str:
+    if unit == "currency":
+        return f"${value:,.2f}"
+    if unit == "hours":
+        return f"{value:,.1f} hours"
+    return f"{value:,.1f}%"
+
+
+def _labor_point(day: date, measure: str, department: str, labor: dict, revenue: dict):
+    day_key = day.isoformat()
+    rev = revenue.get(day_key, {})
+    if measure == "sales":
+        return float(rev.get("total", 0.0) or 0.0), None, None
+
+    lab = labor.get(day_key)
+    if not lab:
+        return None
+    prefix = {"kit": "kit", "foh": "foh", "tot": "total"}[department]
+    if measure == "hours":
+        return float(lab.get(f"{prefix}_hours", 0.0) or 0.0), None, None
+    if measure == "scheduled_hours":
+        return float(lab.get(f"{prefix}_sched", 0.0) or 0.0), None, None
+    if measure == "cost":
+        return float(lab.get(f"{prefix}_cost", 0.0) or 0.0), None, None
+
+    cost = float(lab.get(f"{prefix}_cost", 0.0) or 0.0)
+    if department == "kit":
+        sales_basis = float(rev.get("food", 0.0) or 0.0)
+    elif department == "foh":
+        sales_basis = max(
+            float(rev.get("total", 0.0) or 0.0) - float(rev.get("food", 0.0) or 0.0),
+            0.0,
+        )
+    else:
+        sales_basis = float(rev.get("total", 0.0) or 0.0)
+    if not sales_basis:
+        return None
+    return cost / sales_basis * 100, cost, sales_basis
+
+
+def _answer_labor_question(
+    question: str,
+    fy: int,
+    today: date,
+    labor: dict,
+    revenue: dict,
+) -> str:
+    if not question.strip():
+        return ""
+    q = _normalize_question(question)
+    if "why" in q or "forecast" in q or "predict" in q:
+        return (
+            "I can calculate historical sales and labor performance, but I cannot explain causes or forecast yet. "
+            "Try: What was my average total labor percentage on Fridays over the last 8 weeks?"
+        )
+
+    measure, department, measure_label, unit = _labor_measure(q)
+    source = revenue if measure == "sales" else labor
+    if not source:
+        return "I could not find the requested data for the selected fiscal year."
+
+    start, end = _question_period(q, fy, today)
+    data_dates = sorted(date.fromisoformat(value) for value in source)
+    start = max(start, data_dates[0])
+    end = min(end, data_dates[-1])
+    if start > end:
+        return "I could not find the requested data in that date range."
+
+    weekday = _question_weekday(q)
+    pending = [d for d, row in labor.items()
+               if row.get("import_status") == "pending"
+               and start <= date.fromisoformat(d) <= end
+               and (weekday is None or date.fromisoformat(d).weekday() == weekday)]
+    if measure != "sales" and pending:
+        return (f"Labor totals for this range are incomplete: {len(pending)} day(s) are awaiting "
+                "complete approved time punches. Pending days are excluded from labor subtotals.")
+    aggregation = _question_aggregation(q)
+    points = []
+    current = start
+    while current <= end:
+        if weekday is None or current.weekday() == weekday:
+            point = _labor_point(current, measure, department, labor, revenue)
+            if point is not None:
+                value, numerator, denominator = point
+                points.append((current, value, numerator, denominator))
+        current += timedelta(days=1)
+
+    if not points:
+        day_name = _WEEKDAY_NAMES[weekday] if weekday is not None else "matching"
+        return f"I could not find any {day_name} data for that question and date range."
+
+    range_text = _format_question_range(start, end)
+    day_text = f"{_WEEKDAY_NAMES[weekday]}s" if weekday is not None else "days"
+    subject = f"{_WEEKDAY_NAMES[weekday]} {measure_label}" if weekday is not None else f"daily {measure_label}"
+    values = [point[1] for point in points]
+    verb = "were" if measure in ("sales", "hours", "scheduled_hours") else "was"
+
+    if aggregation == "average":
+        result = sum(values) / len(values)
+        return (
+            f"Average {subject} {verb} {_format_question_value(result, unit)} across "
+            f"{len(points)} {day_text} from {range_text}."
+        )
+    if aggregation == "maximum":
+        result_date, result, _, _ = max(points, key=lambda item: item[1])
+        return (
+            f"The highest {subject} {verb} {_format_question_value(result, unit)} on "
+            f"{result_date.strftime('%A, %B %-d, %Y')} ({len(points)} {day_text} checked)."
+        )
+    if aggregation == "minimum":
+        result_date, result, _, _ = min(points, key=lambda item: item[1])
+        return (
+            f"The lowest {subject} {verb} {_format_question_value(result, unit)} on "
+            f"{result_date.strftime('%A, %B %-d, %Y')} ({len(points)} {day_text} checked)."
+        )
+
+    if unit == "percentage":
+        numerator = sum(point[2] or 0.0 for point in points)
+        denominator = sum(point[3] or 0.0 for point in points)
+        result = numerator / denominator * 100 if denominator else 0.0
+        return (
+            f"Overall {measure_label} was {_format_question_value(result, unit)} across "
+            f"{len(points)} {day_text} from {range_text}."
+        )
+
+    total = sum(values)
+    if aggregation == "total":
+        return (
+            f"Combined {measure_label} {verb} {_format_question_value(total, unit)} across "
+            f"{len(points)} {day_text} from {range_text}."
+        )
+    average = total / len(values)
+    return (
+        f"From {range_text}, {measure_label} totaled {_format_question_value(total, unit)} and "
+        f"averaged {_format_question_value(average, unit)} across {len(points)} {day_text}."
+    )
+
+
+def _question_box_html(fy: int, key: str, question: str, answer: str) -> str:
+    safe_form_key = escape(key, quote=True)
+    safe_question = escape(question, quote=True)
+    if answer:
+        result_html = (
+            '<div class="question-answer" role="status" aria-live="polite">'
+            f'<span class="answer-label">Answer</span>{escape(answer)}</div>'
+        )
+    else:
+        result_html = (
+            '<p class="question-help">Try: “What are my average sales on Monday going back 3 months?”</p>'
+        )
+    return f"""<section class="question-box" aria-label="Ask a labor or sales question">
+  <form class="question-form" method="get">
+    <label class="question-label" for="labor-question">Ask this dashboard</label>
+    <input type="hidden" name="key" value="{safe_form_key}">
+    <input type="hidden" name="year" value="{fy}">
+    <input class="question-input" id="labor-question" name="question" type="text" maxlength="300"
+           value="{safe_question}" placeholder="Ask about sales, labor hours, cost, percentages, or date ranges" required>
+    <button class="question-submit" type="submit">Ask</button>
+  </form>
+  {result_html}
+</section>"""
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +417,7 @@ def _fetch_labor(start: date, end: date) -> dict:
     rows = _supa_paged(
         f"/labor_daily?date=gte.{start}&date=lte.{end}"
         f"&select=date,kit_hours,kit_sched,kit_cost,foh_hours,foh_sched,foh_cost,"
-        f"total_hours,total_sched,total_cost"
+        f"total_hours,total_sched,total_cost,import_status,import_note"
     )
     return {r["date"]: r for r in rows}
 
@@ -151,13 +443,16 @@ def _fetch_revenue(start: date, end: date) -> dict:
     # Tripleseat events
     ts_rows = _supa_paged(
         f"/ts_events?event_date=gte.{start}&event_date=lte.{end}"
-        f"&deleted_at=is.null&select=event_date,actual_amount"
+        f"&deleted_at=is.null&status=in.(DEFINITE,CLOSED,TENTATIVE)"
+        f"&select=event_date,actual_amount,food_amount"
     )
     for row in ts_rows:
         d = row["event_date"]
         if d not in by_date:
             by_date[d] = {"food": 0.0, "total": 0.0}
         amt = float(row.get("actual_amount") or 0)
+        food = float(row.get("food_amount") or 0)
+        by_date[d]["food"] = round(by_date[d]["food"] + food, 2)
         by_date[d]["total"] = round(by_date[d]["total"] + amt, 2)
 
     return by_date
@@ -263,6 +558,13 @@ def _build_rows(fy: int, today: date, labor: dict, revenue: dict) -> list:
                         "_type": "future" if is_fut else "nodata",
                         "date": ds, "day": _DAYS[d.weekday()],
                     }
+                elif lab.get("import_status") == "pending":
+                    row = {
+                        "_type": "pending", "date": ds, "day": _DAYS[d.weekday()],
+                        "total_sales": rev.get("total", 0.0),
+                        "food_sales": rev.get("food", 0.0),
+                        "foh_sales": max(rev.get("total", 0.0) - rev.get("food", 0.0), 0.0),
+                    }
                 else:
                     food_sales  = rev.get("food",  0.0)
                     total_sales = rev.get("total", 0.0)
@@ -309,8 +611,13 @@ def _build_rows(fy: int, today: date, labor: dict, revenue: dict) -> list:
 
 
 def _subtotal_row(data_rows: list, label: str, row_type: str) -> dict:
+    pending_count = sum(r.get("_type") == "pending" for r in data_rows)
+    if pending_count:
+        label += f" — partial ({pending_count} pending)"
+
     def _sum(key):
-        return round(sum(float(r.get(key) or 0) for r in data_rows if r.get("_type") == "data"), 2)
+        included = ("data", "pending") if key in ("total_sales", "food_sales", "foh_sales") else ("data",)
+        return round(sum(float(r.get(key) or 0) for r in data_rows if r.get("_type") in included), 2)
 
     kit_cost  = _sum("kit_cost")
     foh_cost  = _sum("foh_cost")
@@ -331,13 +638,13 @@ def _subtotal_row(data_rows: list, label: str, row_type: str) -> dict:
         "total_sales": total_s,
         "kit_hours":  kit_h,  "kit_sched":  kit_sch,
         "kit_cost":   kit_cost,
-        "kit_pct":    _pct_val(kit_cost, food),
+        "kit_pct":    None if pending_count else _pct_val(kit_cost, food),
         "foh_hours":  foh_h,  "foh_sched":  foh_sch,
         "foh_cost":   foh_cost,
-        "foh_pct":    _pct_val(foh_cost, foh_s),
+        "foh_pct":    None if pending_count else _pct_val(foh_cost, foh_s),
         "tot_hours":  tot_h,  "tot_sched":  tot_sch,
         "tot_cost":   tot_cost,
-        "tot_pct":    _pct_val(tot_cost, total_s),
+        "tot_pct":    None if pending_count else _pct_val(tot_cost, total_s),
     }
 
 
@@ -363,6 +670,15 @@ def _tr(row: dict) -> str:
             f'<td>{label}</td><td>{label}</td><td>{label}</td>'
             f'<td>{label}</td><td>{label}</td><td>{label}</td>'
             f'</tr>'
+        )
+
+    if t == "pending":
+        return (
+            '<tr class="pending">'
+            f'<td>{row["date"]}</td><td>{row["day"]}</td>'
+            f'<td>{_fmt_sales(row.get("total_sales"))}</td>'
+            '<td colspan="9">Pending — awaiting complete approved time punches</td>'
+            '</tr>'
         )
 
     if t in ("week_sub", "period_tot"):
@@ -407,15 +723,41 @@ def _tr(row: dict) -> str:
     )
 
 
-def _render_html(fy: int, rows: list, today: date, key: str) -> str:
+def _render_html(
+    fy: int,
+    rows: list,
+    today: date,
+    key: str,
+    question: str = "",
+    answer: str = "",
+) -> str:
     table_rows = "\n".join(_tr(r) for r in rows)
     cur_period = _periods_to_show(fy, today)
+    safe_key   = quote(key, safe="")
+
+    sales_url = escape(
+        f"https://sales-variance-agent.vercel.app/api/daily_report?key={safe_key}&year={fy}",
+        quote=True,
+    )
+    labor_url = escape(
+        f"https://labor-agent.vercel.app/api/labor_report?key={safe_key}&year={fy}",
+        quote=True,
+    )
+    ids_weekly_meeting_url = "https://ids-weekly-meeting.vercel.app/"
+    event_host_url = "https://eventhost-opal.vercel.app/"
+    dashboard_options = (
+        f'<option value="{sales_url}">Sales Variance</option>'
+        f'<option value="{labor_url}" selected>Labor Report</option>'
+        f'<option value="{ids_weekly_meeting_url}">IDS Weekly Meeting</option>'
+        f'<option value="{event_host_url}">Event Host</option>'
+    )
 
     tabs_html = "".join(
-        f'<a href="?key={key}&year={y}" class="tab{"active" if y == fy else ""}">'
+        f'<a href="?key={safe_key}&amp;year={y}" class="tab{"active" if y == fy else ""}">'
         f'FY{y}</a>'
         for y in reversed(AVAILABLE_YEARS)
     )
+    question_box = _question_box_html(fy, key, question, answer)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -436,6 +778,11 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
     overflow: hidden;
   }}
 
+  body {{
+    display: flex;
+    flex-direction: column;
+  }}
+
   header {{
     background: #1b4332;
     color: #fff;
@@ -450,6 +797,29 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
 
   header h1 {{ font-size: 15px; font-weight: 600; letter-spacing: .4px; }}
   header span {{ font-size: 12px; opacity: .75; }}
+
+  .header-left {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }}
+
+  .dashboard-switcher {{
+    min-height: 30px;
+    border: 1px solid rgba(255,255,255,.35);
+    border-radius: 4px;
+    background: #0d2b1e;
+    color: #fff;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px 8px;
+  }}
+
+  .dashboard-switcher:hover {{ border-color: #95d5b5; }}
+  .dashboard-switcher:focus {{ outline: 2px solid #95d5b5; outline-offset: 2px; }}
+  .dashboard-switcher option {{ background: #fff; color: #1a1a2e; }}
 
   .tab-bar {{
     background: #0d2b1e;
@@ -475,8 +845,74 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
   .tab:hover {{ background: #1b4332; color: #fff; }}
   .tabactive {{ background: #2d6a4f; color: #fff; }}
 
+  .question-box {{
+    background: #fff;
+    border-bottom: 1px solid #dfe5e1;
+    padding: 12px 24px;
+    flex-shrink: 0;
+  }}
+
+  .question-form {{
+    display: grid;
+    grid-template-columns: auto minmax(180px, 720px) auto;
+    align-items: center;
+    gap: 10px;
+  }}
+
+  .question-label {{ font-weight: 700; color: #1b4332; white-space: nowrap; }}
+
+  .question-input {{
+    width: 100%;
+    min-height: 36px;
+    border: 1px solid #aebdb4;
+    border-radius: 5px;
+    padding: 7px 10px;
+    color: #1a1a2e;
+    font: inherit;
+  }}
+
+  .question-input:focus {{ outline: 2px solid #74c69d; outline-offset: 1px; border-color: #2d6a4f; }}
+
+  .question-submit {{
+    min-height: 36px;
+    border: 0;
+    border-radius: 5px;
+    background: #2d6a4f;
+    color: #fff;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 700;
+    padding: 7px 16px;
+  }}
+
+  .question-submit:hover {{ background: #1b4332; }}
+  .question-submit:focus {{ outline: 2px solid #1b4332; outline-offset: 2px; }}
+  .question-help {{ margin: 7px 0 0; color: #66736b; font-size: 11px; }}
+
+  .question-answer {{
+    margin-top: 9px;
+    max-width: 1000px;
+    border-left: 4px solid #40916c;
+    border-radius: 3px;
+    background: #edf8f1;
+    color: #173c2a;
+    padding: 9px 12px;
+    line-height: 1.45;
+  }}
+
+  .answer-label {{
+    display: inline-block;
+    margin-right: 8px;
+    color: #1b4332;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: .5px;
+    text-transform: uppercase;
+  }}
+
   .table-scroll {{
-    height: calc(100vh - 86px);
+    flex: 1;
+    min-height: 0;
     overflow: auto;
   }}
 
@@ -524,6 +960,8 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
   td.tot-sep  {{ border-left: 2px solid #ddd; }}
 
   tr.data:hover {{ background: #f2faf5; }}
+  tr.pending {{ background: #fff3cd; color: #664d03; }}
+  tr.pending td:last-child {{ text-align: left; font-weight: 600; }}
 
   tr.future td, tr.nodata td {{ color: #bbb; background: #fafafa; }}
 
@@ -562,11 +1000,13 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
 
   .legend {{
     display: flex;
+    flex-wrap: wrap;
     gap: 16px;
     padding: 6px 24px;
     font-size: 11px;
     background: #f8f9fa;
     border-bottom: 1px solid #e0e0e0;
+    flex-shrink: 0;
   }}
   .legend span {{ display: flex; align-items: center; gap: 4px; }}
   .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
@@ -581,14 +1021,33 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
     color: #888;
     background: #fff;
   }}
+
+  @media (max-width: 760px) {{
+    header {{ padding: 0 12px; }}
+    header h1 {{ font-size: 13px; }}
+    header > span {{ display: none; }}
+    .header-left {{ gap: 8px; }}
+    .dashboard-switcher {{ max-width: 145px; }}
+    .tab-bar {{ padding: 0 12px; }}
+    .tab {{ padding: 5px 10px; }}
+    .question-box {{ padding: 10px 12px; }}
+    .question-form {{ grid-template-columns: 1fr auto; gap: 8px; }}
+    .question-label {{ grid-column: 1 / -1; }}
+  }}
 </style>
 </head>
 <body>
 <header>
-  <h1>On Par Entertainment — Labor Report</h1>
+  <div class="header-left">
+    <select class="dashboard-switcher" aria-label="Switch dashboard" onchange="window.location.href=this.value">
+      {dashboard_options}
+    </select>
+    <h1>On Par Entertainment — Labor Report</h1>
+  </div>
   <span>FY{fy} &nbsp;·&nbsp; Period {cur_period} &nbsp;·&nbsp; {today.strftime('%B %-d, %Y')} &nbsp;·&nbsp; Refreshes every 5 min</span>
 </header>
 <div class="tab-bar">{tabs_html}</div>
+{question_box}
 <div class="legend">
   <span><span class="dot dot-low"></span> On target</span>
   <span><span class="dot dot-high"></span> Over threshold (KIT &gt;20% · FOH &gt;10% · Total &gt;15%)</span>
@@ -617,7 +1076,7 @@ def _render_html(fy: int, rows: list, today: date, key: str) -> str:
 {table_rows}
   </tbody>
 </table>
-<p class="updated">Source: 7Shifts time punches &nbsp;·&nbsp; Sales from GoTab + Tripleseat &nbsp;·&nbsp; Data refreshes nightly at 6 AM ET</p>
+<p class="updated">Source: approved 7Shifts time punches &nbsp;·&nbsp; Sales from GoTab + Tripleseat &nbsp;·&nbsp; Recent 28 days rechecked nightly · Pending days excluded from labor subtotals</p>
 </div>
 </body>
 </html>"""
@@ -665,7 +1124,12 @@ class handler(BaseHTTPRequestHandler):
             labor   = _fetch_labor(fy_start, fy_end)
             revenue = _fetch_revenue(fy_start, fy_end)
             rows    = _build_rows(fy, today, labor, revenue)
-            html    = _render_html(fy, rows, today, key)
+            question = qs.get("question", [""])[0].strip()[:300]
+            answer = (
+                _answer_labor_question(question, fy, today, labor, revenue)
+                if question else ""
+            )
+            html = _render_html(fy, rows, today, key, question, answer)
 
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

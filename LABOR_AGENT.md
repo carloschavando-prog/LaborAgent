@@ -7,7 +7,7 @@ Nightly fetch cron: https://labor-agent.vercel.app/api/labor_fetch (runs 6 AM ET
 
 ## What It Does
 
-- Pulls actual worked hours/cost and scheduled hours from 7Shifts nightly
+- Reconciles approved worked hours/cost and scheduled hours from 7Shifts nightly; refreshes the last 28 completed local days, all pending dates, and older punch dates modified in the last seven days
 - Stores one row per day in the `labor_daily` Supabase table
 - Serves a live HTML report breaking labor into KIT (Kitchen) and FOH departments
 - Shows labor cost as % of revenue (KIT% vs food sales, FOH% vs non-food sales, Total% vs total sales)
@@ -76,7 +76,7 @@ GET https://api.7shifts.com/v2/reports/hours_and_wages
 Response structure: `users[] → weeks[] → shifts[]`
 Each shift has: `date` (YYYY-MM-DD HH:MM:SS), `role_id`, `total.total_hours`, `total.total_pay`
 
-All punches are counted including unapproved.
+The Worked Hours & Wages report includes approved punches only. Unapproved and open punches make the day pending until resolved in 7shifts. The importer never approves or edits punches.
 
 ### Role → Department Mapping
 
@@ -178,7 +178,7 @@ FY2026 starts December 29, 2025. 5-4-4 quarter pattern:
 
 ## Manual Backfill
 
-Hit this URL for any missed date:
+Call this URL with the existing CRON_SECRET Bearer authorization for any missed completed date:
 ```
 https://labor-agent.vercel.app/api/labor_fetch?date=YYYY-MM-DD
 ```
@@ -199,3 +199,20 @@ https://labor-agent.vercel.app/api/labor_fetch?date=YYYY-MM-DD
 - Vercel serverless: `class handler(BaseHTTPRequestHandler)` pattern
 - Supabase upsert: `Prefer: resolution=merge-duplicates`
 - Rate limit: 7Shifts allows 10 requests/second per token
+
+
+## Import completeness and recovery (October 2026)
+
+- Scheduled runs use America/New_York dates and revisit 28 completed days.
+- Pending dates are retried regardless of age. Recently modified and deleted punches also trigger reimports of older dates.
+- Source calls retry temporary HTTP/network failures three times. Reports are fetched in windows of at most seven days with three workers and a shared API rate limit.
+- Every day is checked against all paginated raw punches. Unapproved/open punches, unknown roles, report/punch count mismatches, malformed payloads, and hours below 25% of an eight-hour-or-longer departmental schedule cause pending status.
+- Pending writes retain the last stored numbers for recovery, but the dashboard hides those numbers, labels affected labor subtotals partial, and suppresses incomplete percentages and question answers. Sales remain included.
+- Valid imports replace the date atomically using an idempotent upsert; returned rows are checked against the intended totals. No time punches or approvals are changed.
+- The scheduled job returns HTTP 503 and logs affected dates when any date remains pending. If CONTROL_BOARD_URL is configured, the existing lifecycle reporter also receives the failure summary.
+- `?date=YYYY-MM-DD&dry_run=1` checks a date without database writes. Omitting date checks the normal rolling window. All calls require CRON_SECRET.
+- For a verified closure with a leftover schedule, `?date=YYYY-MM-DD&allow_empty=1` bypasses only the schedule-ratio check. It never bypasses unapproved/open punches or source reconciliation. Do not use it for missing data.
+- Database rollout: apply `schema/labor_import_status.sql` before deploying this version. Existing rows start as unverified and are unchanged until refreshed.
+- Tests: `python3 -m unittest discover -s tests -v`.
+
+Reference: https://kb.7shifts.com/hc/en-us/articles/4417519622547-Worked-Hours-Wages-Report
